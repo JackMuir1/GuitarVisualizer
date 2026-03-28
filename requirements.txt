@@ -1,0 +1,5 @@
+pygame>=2.5.0
+sounddevice>=0.4.6
+PyYAML>=6.0
+watchdog>=3.0.0
+numpy>=1.26.0
