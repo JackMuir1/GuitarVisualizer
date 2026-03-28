@@ -18,6 +18,7 @@ _NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
     "audio.buffer_size":          (256,    8192),
     "detection.noise_gate_db":    (-80.0,  0.0),
     "detection.confidence_threshold": (0.0, 1.0),
+    "detection.yin_threshold":    (0.05,  0.5),
     "display.fps":                (10,     240),
     "display.interpolation_speed":(0.001,  1.0),
     "display.silence_timeout_sec":(0.1,    60.0),
@@ -37,6 +38,7 @@ DEFAULTS: dict[str, Any] = {
     "detection": {
         "noise_gate_db": -20.0,
         "confidence_threshold": 0.6,
+        "yin_threshold": 0.15,
     },
     "display": {
         "fps": 60,

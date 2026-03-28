@@ -14,9 +14,6 @@ NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 _MIN_FREQ_HZ = 60.0
 _MAX_FREQ_HZ = 1400.0
 
-# YIN threshold: lower = more selective, higher = more permissive
-_YIN_THRESHOLD = 0.15
-
 
 def yin_pitch(samples: np.ndarray, sample_rate: int, threshold: float) -> tuple[float, float]:
     """
@@ -25,70 +22,76 @@ def yin_pitch(samples: np.ndarray, sample_rate: int, threshold: float) -> tuple[
     Returns (frequency_hz, confidence) where confidence is 0.0–1.0.
     Returns (0.0, 0.0) when no clear pitch is found.
 
+    Fully vectorized using FFT-based cross-correlation for low-latency real-time use.
+
     Reference: de Cheveigné & Kawahara, "YIN, a fundamental frequency estimator
     for speech and music", JASA 2002.
     """
     n = len(samples)
     half = n // 2
+    x = samples.astype(np.float64)
+    w = half  # analysis window size
 
-    # Step 1: Difference function
-    # d(tau) = sum((x[j] - x[j+tau])^2) for j in [0, half)
-    diff = np.zeros(half, dtype=np.float64)
-    for tau in range(1, half):
-        delta = samples[:half] - samples[tau: tau + half]
-        diff[tau] = float(np.dot(delta, delta))
+    # --- Step 1: Difference function (vectorized via FFT cross-correlation) ---
+    # d[tau] = sum_{j=0}^{w-1} (x[j] - x[j+tau])^2
+    #        = sum(x[:w]^2) + sum(x[tau:tau+w]^2) - 2 * cross[tau]
+    # where cross[tau] = sum_j x[:w][j] * x[j+tau]
 
-    # Step 2: Cumulative mean normalized difference function
-    cmndf = np.zeros(half, dtype=np.float64)
+    fft_size = 1 << (n + w - 1).bit_length()
+    Xa = np.fft.rfft(x[:w], n=fft_size)
+    Xb = np.fft.rfft(x, n=fft_size)
+    cross = np.fft.irfft(np.conj(Xa) * Xb)[:half]
+
+    sq_cumsum = np.empty(n + 1, dtype=np.float64)
+    sq_cumsum[0] = 0.0
+    np.cumsum(x ** 2, out=sq_cumsum[1:])
+
+    tau_arr = np.arange(half, dtype=np.int64)
+    end_arr = np.minimum(tau_arr + w, n)
+    sum_sq_tau = sq_cumsum[end_arr] - sq_cumsum[tau_arr]
+    sum_sq_0 = sq_cumsum[w]
+
+    diff = np.maximum(0.0, sum_sq_0 + sum_sq_tau - 2.0 * cross)
+    diff[0] = 0.0
+
+    # --- Step 2: Cumulative mean normalized difference (vectorized) ---
+    cum_diff = np.cumsum(diff)
+    taus_f = np.arange(half, dtype=np.float64)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cmndf = np.where(cum_diff > 0.0, diff * taus_f / cum_diff, 1.0)
     cmndf[0] = 1.0
-    running_sum = 0.0
-    for tau in range(1, half):
-        running_sum += diff[tau]
-        if running_sum == 0.0:
-            cmndf[tau] = 1.0
-        else:
-            cmndf[tau] = diff[tau] * tau / running_sum
 
-    # Step 3: Find the first tau where cmndf dips below threshold
-    tau_min = _MIN_PERIOD(sample_rate)
-    tau_max = _MAX_PERIOD(sample_rate, half)
+    # --- Step 3: Find first tau below threshold in valid frequency range ---
+    tau_min = max(2, int(sample_rate / _MAX_FREQ_HZ))
+    tau_max = min(half - 1, int(sample_rate / _MIN_FREQ_HZ) + 1)
 
-    tau_est = 0
-    for tau in range(tau_min, tau_max):
-        if cmndf[tau] < threshold:
-            # Keep going while still descending (find local minimum)
-            while tau + 1 < tau_max and cmndf[tau + 1] < cmndf[tau]:
-                tau += 1
-            tau_est = tau
-            break
-
-    if tau_est == 0:
+    below = np.where(cmndf[tau_min:tau_max] < threshold)[0]
+    if len(below) == 0:
         return 0.0, 0.0
 
-    # Step 4: Parabolic interpolation to refine the period estimate
+    tau = int(below[0]) + tau_min
+    # Walk to the local minimum
+    while tau + 1 < tau_max and cmndf[tau + 1] < cmndf[tau]:
+        tau += 1
+    tau_est = tau
+
+    # --- Step 4: Parabolic interpolation ---
     if 0 < tau_est < half - 1:
-        s0 = cmndf[tau_est - 1]
-        s1 = cmndf[tau_est]
-        s2 = cmndf[tau_est + 1]
+        s0 = float(cmndf[tau_est - 1])
+        s1 = float(cmndf[tau_est])
+        s2 = float(cmndf[tau_est + 1])
         denom = s0 - 2.0 * s1 + s2
-        if denom != 0.0:
-            tau_refined = tau_est + (s0 - s2) / (2.0 * denom)
+        if denom > 1e-10:
+            correction = max(-0.5, min(0.5, (s0 - s2) / (2.0 * denom)))
+            tau_refined = float(tau_est) + correction
         else:
             tau_refined = float(tau_est)
     else:
         tau_refined = float(tau_est)
 
-    frequency = sample_rate / tau_refined
-    confidence = max(0.0, 1.0 - cmndf[tau_est])
+    frequency = float(sample_rate) / max(tau_refined, 1.0)
+    confidence = max(0.0, 1.0 - float(cmndf[tau_est]))
     return frequency, confidence
-
-
-def _MIN_PERIOD(sample_rate: int) -> int:
-    return max(2, int(sample_rate / _MAX_FREQ_HZ))
-
-
-def _MAX_PERIOD(sample_rate: int, half: int) -> int:
-    return min(half - 1, int(sample_rate / _MIN_FREQ_HZ) + 1)
 
 
 class AudioEngine:
@@ -98,12 +101,14 @@ class AudioEngine:
 
         self._current_note: Optional[str] = None
         self._amplitude_db: float = -80.0
+        self._last_logged_note: Optional[str] = None
 
         self._sample_rate: int = 44100
         self._buffer_size: int = 1024
         self._device: Optional[str | int] = None
         self._noise_gate_db: float = -20.0
         self._confidence_threshold: float = 0.6
+        self._yin_threshold: float = 0.15
 
         self.update_config(config)
 
@@ -134,7 +139,7 @@ class AudioEngine:
             return self._amplitude_db
 
     def update_config(self, config: dict[str, Any]) -> None:
-        """Apply updated config values (noise gate, confidence threshold)."""
+        """Apply updated config values."""
         audio_cfg = config.get("audio", {})
         det_cfg = config.get("detection", {})
 
@@ -143,6 +148,7 @@ class AudioEngine:
         self._device = audio_cfg.get("device", None)
         self._noise_gate_db = float(det_cfg.get("noise_gate_db", -20.0))
         self._confidence_threshold = float(det_cfg.get("confidence_threshold", 0.6))
+        self._yin_threshold = float(det_cfg.get("yin_threshold", 0.15))
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -199,15 +205,29 @@ class AudioEngine:
         amplitude_db = self._rms_to_db(mono)
 
         note: Optional[str] = None
+        freq: float = 0.0
+        confidence: float = 0.0
+
         if amplitude_db >= self._noise_gate_db:
             freq, confidence = yin_pitch(
-                mono.astype(np.float64), self._sample_rate, _YIN_THRESHOLD
+                mono.astype(np.float64), self._sample_rate, self._yin_threshold
+            )
+            logger.debug(
+                "YIN: amp=%.1f dB  freq=%.1f Hz  conf=%.2f", amplitude_db, freq, confidence
             )
             if (
                 confidence >= self._confidence_threshold
                 and _MIN_FREQ_HZ <= freq <= _MAX_FREQ_HZ
             ):
                 note = self._hz_to_note(freq)
+
+        # Log note changes at INFO so they're visible in the console by default
+        if note != self._last_logged_note:
+            logger.info(
+                "Note: %s → %s  (%.1f Hz, conf=%.2f, amp=%.1f dB)",
+                self._last_logged_note, note, freq, confidence, amplitude_db,
+            )
+            self._last_logged_note = note
 
         with self._lock:
             self._current_note = note

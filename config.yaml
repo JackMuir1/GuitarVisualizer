@@ -5,7 +5,8 @@ audio:
 
 detection:
   noise_gate_db: -20    # dBFS threshold; signals below this are ignored
-  confidence_threshold: 0.6  # aubio pitch confidence minimum
+  confidence_threshold: 0.6  # minimum YIN confidence to accept a pitch (0.0–1.0)
+  yin_threshold: 0.15        # YIN CMNDF threshold; lower = more selective (0.05–0.5)
 
 display:
   fps: 60
